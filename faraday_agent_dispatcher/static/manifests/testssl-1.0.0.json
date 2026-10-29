@@ -1,5 +1,10 @@
 {
     "arguments": {
+        "TESTSSL_EVIDENCE": {
+            "mandatory": false,
+            "type": "boolean",
+            "base": "boolean"
+        },
         "TESTSSL_TARGET": {
             "mandatory": true,
             "type": "list",
