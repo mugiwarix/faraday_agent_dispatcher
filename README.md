@@ -107,6 +107,10 @@ The current official executors are:
 * [QualysGuard] [qualys]
 * [Sonar Qube API][sonarqubeapi]
 * [Sublist3r][sublist3r]
+* [testssl.sh][testssl]: scans a TLS endpoint for deprecated protocols, weak
+  cipher suites, the usual named attacks and certificate problems, and imports
+  them as Faraday vulnerabilities named after the Nessus findings of the issue
+  catalog
 * [W3af][w3af]
 * [Wpscan][wpscan]
 * [Zap][zap]
@@ -131,6 +135,7 @@ development executors. The most important of them are:
 [dev_executors]: https://github.com/infobyte/faraday_agent_dispatcher/tree/master/faraday_agent_dispatcher/static/executors/dev
 [brainfuck]: https://en.wikipedia.org/wiki/Brainfuck
 [prowler]: https://github.com/toniblyx/prowler
+[testssl]: https://testssl.sh/
 [nessus]: https://www.nessus.org
 [nikto]: https://cirt.net/Nikto2
 [nmap]: https://nmap.org

@@ -1,0 +1,96 @@
+{
+    "arguments": {
+        "TESTSSL_TARGET": {
+            "mandatory": true,
+            "type": "list",
+            "base": "list"
+        },
+        "TESTSSL_PORTS": {
+            "mandatory": false,
+            "type": "list",
+            "base": "list"
+        },
+        "TESTSSL_VULN": {
+            "mandatory": false,
+            "type": "list",
+            "base": "list"
+        },
+        "TESTSSL_ISSUE": {
+            "mandatory": false,
+            "type": "list",
+            "base": "list"
+        },
+        "TESTSSL_EXCLUDE_VULN": {
+            "mandatory": false,
+            "type": "list",
+            "base": "list"
+        },
+        "TESTSSL_STARTTLS": {
+            "mandatory": false,
+            "type": "string",
+            "base": "string"
+        },
+        "TESTSSL_CONNECT_TIMEOUT": {
+            "mandatory": false,
+            "type": "integer",
+            "base": "integer"
+        },
+        "TESTSSL_OPENSSL_TIMEOUT": {
+            "mandatory": false,
+            "type": "integer",
+            "base": "integer"
+        },
+        "TESTSSL_TIMEOUT": {
+            "mandatory": false,
+            "type": "integer",
+            "base": "integer"
+        },
+        "TESTSSL_NODNS": {
+            "mandatory": false,
+            "type": "string",
+            "base": "string"
+        },
+        "TESTSSL_SNEAKY": {
+            "mandatory": false,
+            "type": "boolean",
+            "base": "boolean"
+        },
+        "TESTSSL_IDS_FRIENDLY": {
+            "mandatory": false,
+            "type": "boolean",
+            "base": "boolean"
+        },
+        "TESTSSL_PHONE_OUT": {
+            "mandatory": false,
+            "type": "boolean",
+            "base": "boolean"
+        },
+        "TESTSSL_INCLUDE_INFO": {
+            "mandatory": false,
+            "type": "boolean",
+            "base": "boolean"
+        },
+        "TESTSSL_EXTRA_ARGS": {
+            "mandatory": false,
+            "type": "string",
+            "base": "string"
+        }
+    },
+    "environment_variables": [
+        "TESTSSL_PATH",
+        "OPENSSL_PATH"
+    ],
+    "check_cmds": [
+        "testssl.sh --version 2>&1",
+        "openssl version 2>&1"
+    ],
+    "cmd": "{EXECUTOR_FILE_PATH}",
+    "category": "Network and Vulnerability Scanners",
+    "name": "testssl",
+    "title": "testssl.sh",
+    "website": "https://testssl.sh/",
+    "description": "testssl.sh \u2014 TLS/SSL endpoint scanner. Runs one testssl.sh scan per target with just the test groups the selected checks need, and imports the actionable findings as Faraday vulnerabilities whose names track the Nessus findings the issue catalog expects: deprecated protocols (SSLv2/SSLv3/TLS 1.0/1.1), anonymous / export / low / 3DES-IDEA / CBC cipher suites, Heartbleed, CCS injection, Ticketbleed, ROBOT, Secure Renegotiation, CRIME, BREACH, POODLE, SWEET32, FREAK, LOGJAM, DROWN, BEAST, Lucky13, WinShock, RC4, weak / no forward secrecy, missing post-quantum KEMs, and certificate problems (expired, weak signature hash or key size, no commonName, no subject, no subjectAltName, wrong hostname, untrusted or self-signed chain) plus missing HSTS. TESTSSL_TARGET is a list of hosts, host:port pairs or URLs. TESTSSL_PORTS expands targets that carry no port. TESTSSL_VULN (and TESTSSL_ISSUE) scope the scan and the report \u2014 each item is a check name (heartbleed, tls1_0, cert_expired, weak_dh, hsts, post_quantum_kex, ...), a Faraday vulnerability name, a catalog issue name such as 'SSL/TLS Multiple Issues' or 'Weak Cryptography', a CVE id or a Nessus plugin id; group aliases all/cert/cipher/protocol/attack work too, and an empty value runs every SSL/TLS check. TESTSSL_EXCLUDE_VULN drops selected checks. Severities are pinned per check rather than taken from the tool, so ratings stay stable across testssl.sh releases. TESTSSL_STARTTLS (ftp, smtp, lmtp, pop3, imap, xmpp, xmpp-server, telnet, ldap, nntp, sieve, postgres, mysql) turns a plaintext port into a TLS scan. TESTSSL_NODNS=min (default) permits only forward DNS resolution needed for targets and skips CAA/PTR lookups; TESTSSL_NODNS=none disables DNS entirely and requires an IP target, --ip, or /etc/hosts. TESTSSL_SNEAKY=true uses Firefox HTTP user-agent for less verbose traces; it does not hide activity or suppress DNS. TESTSSL_IDS_FRIENDLY=true lowers the packet rate, TESTSSL_PHONE_OUT=true allows the outbound lookups, TESTSSL_INCLUDE_INFO=true also reports the informational records (protocol / cipher inventory, PFS support, certificate inventory, overall grade). TESTSSL_CONNECT_TIMEOUT / TESTSSL_OPENSSL_TIMEOUT / TESTSSL_TIMEOUT (seconds) bound the scan, TESTSSL_EXTRA_ARGS passes raw testssl.sh flags, TESTSSL_PATH / OPENSSL_PATH point at non-default binaries.",
+    "image": null,
+    "manifest_version": "1.0.0",
+    "repo_executor": "testssl.py"
+}

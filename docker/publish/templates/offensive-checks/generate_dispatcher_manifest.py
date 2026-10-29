@@ -478,6 +478,7 @@ AGENT_GROUPS = {
             "insightvm",
             "qualys",
             "gvm_openvas",
+            "testssl",
             "tripwire_ip360",
             "vulndb",
             "edgescan",
@@ -500,7 +501,11 @@ AGENT_GROUPS = {
             "Enterprise vulnerability management and report ingest. Pulls findings from "
             "Nessus, Tenable.io and Tenable.sc (Tenable family), Rapid7 InsightVM, Qualys "
             "VMDR, and OpenVAS/GVM; plus report_processor as a generic SARIF/JSON/XML "
-            "import path for scan exports produced outside the agents. OT / ICS sensors "
+            "import path for scan exports produced outside the agents. testssl runs "
+            "testssl.sh live against TLS endpoints — one scan per target, scoped by "
+            "TESTSSL_VULN (check names, catalog issue names, CVEs or Nessus plugin ids), "
+            "with the findings reported under the SSL/TLS Nessus names the issue catalog "
+            "matches on. OT / ICS sensors "
             "(Cisco Cyber Vision, Claroty CTD / xDome, Forescout eyeInspect, Nozomi "
             "Guardian / Vantage, Ordr) live in the sibling `ot-security` group. Each "
             "vendor needs its API URL + token as agent env vars "

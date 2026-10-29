@@ -128,16 +128,22 @@ ARG KUBESCAPE_VERSION=3.0.22
 ARG KUBE_BENCH_VERSION=0.10.0
 ARG TFSEC_VERSION=1.28.13
 ARG AMASS_VERSION=4.2.0
+ARG TESTSSL_VERSION=3.2.4
 
 USER root
 
 # System packages: shellcheck (SAST shell), node/npm (snyk), pipx (isolated py CLIs),
 # libpcap for naabu, masscan (folded in here rather than as a later layer because
 # the runner's disk fills up across the cumulative pipx-install layers below) and
-# the usual download tooling.
+# the usual download tooling. The openssl/file/procps/bsdextrautils/xxd/dnsutils set
+# is what testssl.sh needs at runtime: openssl does the handshakes, file inspects the
+# binary, hexdump+ps come from bsdextrautils+procps (both absent from the slim base
+# and hard-required by testssl.sh's dependency check), xxd speeds up the raw-byte
+# parsing and dig answers the name-resolver queries.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git unzip tar xz-utils jq \
         shellcheck nodejs npm pipx libpcap0.8 masscan \
+        openssl file procps bsdextrautils xxd dnsutils \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Python CLI tools in isolated pipx envs (avoids clashing with the dispatcher venv).
@@ -198,6 +204,9 @@ RUN set -eux; \
     dl -o /usr/local/bin/tfsec "https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}/tfsec-linux-${TARGETARCH}" && chmod +x /usr/local/bin/tfsec; \
     # amass (subdomain + DNS recon)
     dl -o amass.zip "https://github.com/owasp-amass/amass/releases/download/v${AMASS_VERSION}/amass_Linux_${TARGETARCH}.zip" && unzip -j -o amass.zip "*/amass" -d /usr/local/bin/ && rm amass.zip; \
+    # testssl.sh (single-file bash TLS scanner; pinned tag, upstream ships no binary release)
+    dl -o /usr/local/bin/testssl.sh "https://raw.githubusercontent.com/drwetter/testssl.sh/v${TESTSSL_VERSION}/testssl.sh" \
+        && head -1 /usr/local/bin/testssl.sh | grep -q bash; \
     chmod +x /usr/local/bin/*; \
     rm -rf /tmp/*
 
