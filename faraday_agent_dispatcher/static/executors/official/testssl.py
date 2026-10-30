@@ -251,12 +251,13 @@ CHECKS = {
     },
     "renegotiation": {
         "name": "SSL / TLS Renegotiation Handshakes MiTM Plaintext Data Injection",
-        "ids": ["secure_renego", "secure_client_renego", "client_renegotiation", "insecure_renego"],
+        # secure_client_renego is CVE-2011-1473 DoS, not MiTM injection.
+        "ids": ["secure_renego"],
         "flags": ["-R"],
         "severity": "medium",
         "require": [r"vulnerab|not supported|insecure|^accepted"],
         "exclude": [r"not vulnerable"],
-        "cve": ["CVE-2009-3555", "CVE-2011-1473"],
+        "cve": ["CVE-2009-3555"],
         "nessus": [42880],
         "tags": ["attack"],
         "issue": ISSUE_SSL_TLS,
@@ -758,7 +759,9 @@ def parse_findings(json_path):
         data = _salvage_objects(text)
     if isinstance(data, dict):
         data = [data]
-    return [entry for entry in data if isinstance(entry, dict) and entry.get("id")]
+    if not isinstance(data, list):
+        return []
+    return [entry for entry in data if isinstance(entry, dict) and type(entry.get("id")) is str and entry["id"]]
 
 
 def _salvage_objects(text):
@@ -782,12 +785,14 @@ def _matches(patterns, finding):
 
 def _reportable(check, severity, finding):
     """Whether one finding record proves ``check``."""
+    if severity not in set(TESTSSL_SEVERITY) | {"OK"}:
+        return False
     if _matches(check.get("exclude"), finding):
         return False
     if check.get("require") and not _matches(check["require"], finding):
         return False
     if check.get("severity"):
-        # The check names its own severity, so testssl.sh may rate it INFO/OK.
+        # The check names its own severity, so testssl.sh may rate it OK.
         return True
     return severity in TESTSSL_SEVERITY
 
@@ -823,7 +828,8 @@ def build_vulnerabilities(entries, check_keys, options):
         ]
         if check.get("mode") == "absent":
             # The finding is that nothing in the scan proves the safe pattern.
-            if not records or _matches(check.get("require"), " ".join(text for _, text, _ in records)):
+            if (not records or any(severity not in set(TESTSSL_SEVERITY) | {"OK"} for _, _, severity in records)
+                    or _matches(check.get("require"), " ".join(text for _, text, _ in records))):
                 continue
             matched, severity_value = records, check["severity"]
         else:
@@ -851,11 +857,10 @@ def build_vulnerability(key, check, matched, severity):
         ),
         "severity": severity,
         "type": "Vulnerability",
-        "tool": TOOL,
         "external_id": f"{EXECUTOR}:{key}",
         "refs": refs,
         "cve": check.get("cve", []),
-        "output": findings,
+        "data": findings,
         "resolution": check.get("resolution", ""),
     }
 
@@ -876,11 +881,10 @@ def build_info_vulnerabilities(by_id):
                 "desc": "testssl.sh survey:\n" + "\n".join(lines),
                 "severity": "info",
                 "type": "Vulnerability",
-                "tool": TOOL,
                 "external_id": f"{EXECUTOR}:{name.lower().replace(' ', '-')}",
                 "refs": [],
                 "cve": [],
-                "output": "\n".join(lines),
+                "data": "\n".join(lines),
                 "resolution": "",
             }
         )

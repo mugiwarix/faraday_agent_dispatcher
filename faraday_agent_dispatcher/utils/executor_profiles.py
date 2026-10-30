@@ -11,15 +11,15 @@
 # ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 # FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
 
-"""Package-owned validator profiles: declarative manifest plus trusted Python.
+"""Approved validation profiles for the bundled official executors.
 
 A profile binds one approved executor to a fixed target policy and a closed set
 of evidence criteria. Manifests contain literal arguments, not templates or code,
 and only the handlers below can turn a manifest into an executed command, so a new
 manifest can never introduce an arbitrary command, flag set, or target selection.
 
-This module is shared by whoever dispatches a validator job. It reads only
-package data and never imports an application, database, or network stack.
+This module is shared by whoever dispatches a validator job. It loads package
+metadata and official executor helpers, with no scanner execution or network I/O.
 """
 
 import copy
@@ -28,20 +28,18 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .limits import (
-    MAX_IDENTIFIER_BYTES, ProfileError, checked_text, integer, keys, require,
-    same_value, strings, text,
+from .profile_limits import (
+    MAX_IDENTIFIER_BYTES, ProfileError, canonical_bytes, checked_text, integer, keys,
+    require, same_value, strict_json, strings, text,
 )
-from .rules import EVIDENCE_RULES
+from faraday_agent_dispatcher.static.executors.official import nmap, testssl
 
-MANIFEST_DIRECTORY = Path(__file__).with_name("manifests")
+MANIFEST_DIRECTORY = Path(__file__).resolve().parent.parent / "static" / "manifests"
 _MAX_MANIFEST_BYTES = 128 * 1024
 # Handler -> executor, claim field, candidate field. No dynamic imports or paths.
 _HANDLERS = {"nmap_tls": ("nmap", "protocol", "protocol"), "testssl": ("testssl", "check_id", "check_ids")}
-_TESTSSL_FLAGS = frozenset({
-    "-p", "-s", "-f", "-S", "-h", "-U", "-W", "-4", "-L", "-J", "-H", "-I",
-    "-T", "--robot", "-R", "-C", "-B", "-O", "-Z", "-F", "-D", "-A", "--winshock",
-})
+# -U remains in historical profile ordering, but no approved check selects it.
+_TESTSSL_FLAGS = frozenset(flag for check in testssl.CHECKS.values() for flag in check["flags"]) | {"-U"}
 _PUBLIC_KEYS = {"id", "executor_id", "title", "description", "verdicts", "automatic_statuses", "arguments", "target"}
 _MANIFEST_KEYS = _PUBLIC_KEYS | {
     "manifest_version", "handler", "success_reason", "rejection_reason", "platforms",
@@ -98,11 +96,12 @@ def _validate_manifest(data):
         ] and set(runtime["flag_order"]) <= _TESTSSL_FLAGS and data.get("tool_version") == "3.2.4", "Unsafe testssl runtime policy")
     require(type(data["checks"]) is dict and bool(data["checks"]))
     for criterion, check in data["checks"].items():
-        require(bool(re.fullmatch(r"TLSv1\.[01]", criterion)) if nmap else criterion in EVIDENCE_RULES, "Unsupported profile evidence criterion")
+        require(bool(re.fullmatch(r"TLSv1\.[01]", criterion)) if nmap else criterion in testssl.validation_check_ids(), "Unsupported profile evidence criterion")
         require(type(check) is dict and set(check) == {"name", "aliases", "cves", "flags"})
         require(_text(check["name"]) and all(strings(check[key]) for key in ("aliases", "cves", "flags")))
         require(all(re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", cve) for cve in check["cves"]))
-        require(not check["cves"] and not check["flags"] if nmap else bool(check["flags"]) and set(check["flags"]) <= _TESTSSL_FLAGS)
+        require(not check["cves"] and not check["flags"] if nmap else
+                set(check["flags"]) == set(testssl.validation_check(criterion)["flags"]))
 
 
 @dataclass(frozen=True)
@@ -146,7 +145,7 @@ class Profile:
 
     def _supported(self, criterion):
         return (criterion in self._data["checks"] and (self.claim_field == "protocol"
-                or "unavailable" not in EVIDENCE_RULES[criterion]))
+                or testssl.validation_available(criterion)))
 
     def match(self, name, cves=()):
         selected = set(self._names.get(str(name or "").strip().casefold(), ()))
@@ -175,7 +174,7 @@ class Profile:
         return arguments
 
     def validate_task(self, task):
-        from .limits import literal_target
+        from .profile_limits import literal_target
 
         require(task["profile_id"] == self.id and task["executor_id"] == self.executor_id, "Unsupported executor profile")
         literal_target(task["target"])
@@ -203,10 +202,8 @@ class Profile:
 
     def evaluate(self, task, result):
         if self.handler_id == "nmap_tls":
-            from .nmap import evaluate_task
-            return evaluate_task(task, result)
-        from .testssl import evaluate_records
-        return evaluate_records(task, result, profile=self)
+            return nmap.evaluate_task(task, result)
+        return testssl.evaluate_records(task, result, profile=self)
 
 
 def _reject_pairs(pairs):
@@ -217,28 +214,39 @@ def _reject_pairs(pairs):
     return result
 
 
-def load_profiles(directory):
-    """Strict, bounded loader. Production directory is package-owned, never job input."""
+def load_profiles(directory=MANIFEST_DIRECTORY):
+    """Load validation_profiles lists inside official executor manifests.
+
+    Directory is package-owned, never task input. Other executor metadata is
+    ignored; only the closed handler set can produce an approved invocation.
+    """
     loaded = {}
     try:
         paths = sorted(Path(directory).glob("*.json"))
-        require(1 <= len(paths) <= 128, "Invalid profile manifest count")
+        require(1 <= len(paths) <= 1024, "Invalid executor manifest count")
         for path in paths:
             require(not path.is_symlink() and path.is_file() and path.stat().st_size <= _MAX_MANIFEST_BYTES)
             with path.open("rb") as stream:
                 raw = stream.read(_MAX_MANIFEST_BYTES + 1)
             require(0 < len(raw) <= _MAX_MANIFEST_BYTES)
-            data = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_pairs,
-                              parse_constant=lambda _value: (_ for _ in ()).throw(ProfileError("Invalid profile JSON constant")))
-            _validate_manifest(data)
-            require(data["id"] not in loaded, "Duplicate profile id")
-            executor, claim, candidate = _HANDLERS[data["handler"]]
-            metadata = copy.deepcopy({key: data[key] for key in _PUBLIC_KEYS})
-            metadata.update(tool_version=data.get("tool_version", ""), options=copy.deepcopy({
-                "characteristics": data["characteristics"], "checks": data["checks"],
-            }))
-            loaded[data["id"]] = Profile(data["id"], executor, claim, candidate, data["success_reason"],
-                                         data["rejection_reason"], metadata, tuple(data["platforms"]), data["handler"], data)
+            manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_pairs,
+                                  parse_constant=lambda _value: (_ for _ in ()).throw(ProfileError("Invalid profile JSON constant")))
+            require(type(manifest) is dict, "Invalid executor manifest")
+            entries = manifest.get("validation_profiles", [])
+            require(type(entries) is list and len(entries) <= 128, "Invalid validation profiles")
+            for data in entries:
+                _validate_manifest(data)
+                require(manifest.get("name") == data["executor_id"], "Profile executor mismatch")
+                require(data["id"] not in loaded, "Duplicate profile id")
+                require(len(loaded) < 128, "Invalid profile manifest count")
+                executor, claim, candidate = _HANDLERS[data["handler"]]
+                metadata = copy.deepcopy({key: data[key] for key in _PUBLIC_KEYS})
+                metadata.update(tool_version=data.get("tool_version", ""), options=copy.deepcopy({
+                    "characteristics": data["characteristics"], "checks": data["checks"],
+                }))
+                loaded[data["id"]] = Profile(data["id"], executor, claim, candidate, data["success_reason"],
+                                             data["rejection_reason"], metadata, tuple(data["platforms"]), data["handler"], data)
+        require(bool(loaded), "No validation profiles")
     except (OSError, UnicodeError, TypeError, RecursionError, OverflowError) as exc:
         raise ProfileError("Invalid profile manifest") from exc
     return dict(sorted(loaded.items()))
@@ -262,3 +270,34 @@ def profile_for_handler(handler_id):
         if profile.handler_id == handler_id:
             return profile
     raise ProfileError("Unsupported profile handler")
+
+
+SUPPORTED_HANDLERS = tuple(_HANDLERS)
+
+
+@dataclass(frozen=True)
+class Command:
+    """Official executor invocation; stdout contains all validation evidence."""
+
+    handler_id: str
+    argv: tuple
+    environment: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        object.__setattr__(self, "argv", tuple(self.argv))
+        object.__setattr__(self, "environment", dict(self.environment))
+
+
+def build_command(profile, task, *, work_dir=None):
+    """Preflight one task without I/O to targets; paths come only from the image.
+
+    Runner supplies a sanitized task environment and merges command.environment.
+    work_dir remains part of the runner API; evidence files are executor-private.
+    """
+    require(profile.handler_id in SUPPORTED_HANDLERS, "Unsupported executor profile")
+    require(get_profile(profile.id) is profile, "Unsupported executor profile")
+    profile.validate_task(task)
+    if profile.handler_id == "nmap_tls":
+        return Command(profile.handler_id, nmap.executor_argv(),
+                       {**profile.runtime["environment"], "FAD_VALIDATION_MODE": "1"})
+    return Command(profile.handler_id, testssl.executor_argv(), testssl.validation_environment(profile, task))

@@ -229,6 +229,19 @@ def test_negative_findings_are_never_reported():
     assert build(scan_entries(), keys) == []
 
 
+def test_analysis_errors_do_not_inherit_pinned_severities():
+    entries = [finding("TLS1", "offered (analysis failed)", "ERROR"),
+               finding("FS_KEMs", "could not test", "WARN")]
+    assert build(entries, ["tls1_0", "post_quantum_kex"]) == []
+
+
+def test_client_renegotiation_dos_is_not_mitm_injection():
+    entries = [finding("secure_client_renego", "VULNERABLE (DoS)", "HIGH")]
+    assert build(entries, ["renegotiation"]) == []
+    entries.append(finding("secure_renego", "VULNERABLE", "CRITICAL"))
+    assert len(build(entries, ["renegotiation"])) == 1
+
+
 def test_positive_attack_findings_use_pinned_severities():
     entries = scan_entries(
         [
@@ -342,9 +355,9 @@ def test_host_service_and_vulnerability_shape():
     assert set(service) == {"name", "port", "protocol", "vulnerabilities"}
     assert service["name"] == "https" and service["port"] == 443
     for vuln in vulns:
-        assert set(vuln) >= {"name", "desc", "severity", "type", "tool", "external_id", "refs", "cve", "resolution"}
-        assert vuln["tool"] == "testssl.sh"
-        assert vuln["desc"] and vuln["resolution"]
+        assert set(vuln) >= {"name", "desc", "severity", "type", "data", "external_id", "refs", "cve", "resolution"}
+        assert "tool" not in vuln and "output" not in vuln
+        assert vuln["data"] and vuln["desc"] and vuln["resolution"]
     assert json.dumps({"hosts": [host], "command": {}})
 
 

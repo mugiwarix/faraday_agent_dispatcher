@@ -9,11 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from faraday_agent_dispatcher.validators import (
+from faraday_agent_dispatcher.utils.executor_profiles import (
     MANIFEST_DIRECTORY, ProfileError, get_profile, load_profiles, profiles,
 )
-from faraday_agent_dispatcher.validators.rules import EVIDENCE_RULES
-from faraday_agent_dispatcher.validators.testssl import CHECKS
+from faraday_agent_dispatcher.static.executors.official import testssl
 
 NMAP_PROFILE_ID = "nmap-tls-protocols"
 TESTSSL_PROFILE_ID = "testssl-3.2.4-ssl-tls"
@@ -21,7 +20,16 @@ TARGET = "192.0.2.10"
 
 
 def manifest(profile_id=NMAP_PROFILE_ID):
-    return json.loads((MANIFEST_DIRECTORY / f"{profile_id}.json").read_text(encoding="utf-8"))
+    for path in MANIFEST_DIRECTORY.glob("*.json"):
+        for profile in json.loads(path.read_text(encoding="utf-8")).get("validation_profiles", []):
+            if profile["id"] == profile_id:
+                return profile
+    raise AssertionError(profile_id)
+
+
+def executor_manifest(data):
+    return {"name": data.get("executor_id", "nmap") if type(data) is dict else "nmap",
+            "validation_profiles": [data]}
 
 
 def task_for(profile, name="TLS Version 1.0 Deprecated Protocol", cves=()):
@@ -34,7 +42,7 @@ def task_for(profile, name="TLS Version 1.0 Deprecated Protocol", cves=()):
 class ProfileLoaderTests(unittest.TestCase):
     def load(self, data):
         with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "profile.json").write_text(json.dumps(data), encoding="utf-8")
+            Path(directory, "profile.json").write_text(json.dumps(executor_manifest(data)), encoding="utf-8")
             return load_profiles(directory)
 
     def test_shipped_profiles_are_sorted_and_metadata_excludes_executable_fields(self):
@@ -94,7 +102,7 @@ class ProfileLoaderTests(unittest.TestCase):
                 path.write_bytes(raw)
                 with self.subTest(raw=raw[:25]), self.assertRaises(ValueError):
                     load_profiles(directory)
-            path.write_text(json.dumps(manifest()), encoding="utf-8")
+            path.write_text(json.dumps(executor_manifest(manifest())), encoding="utf-8")
             duplicate = Path(directory, "duplicate.json")
             duplicate.write_bytes(path.read_bytes())
             with self.assertRaisesRegex(ValueError, "Duplicate profile id"):
@@ -156,10 +164,10 @@ class ProfileBehaviourTests(unittest.TestCase):
         self.assertEqual(profile.candidate_fields("SSL Self-Signed Certificate"), {"check_ids": ["cert_self_signed"]})
         self.assertNotIn("cert_untrusted", profile.criteria)
         self.assertNotIn("cert_cn_mismatch", profile.criteria)
-        for key, rule in EVIDENCE_RULES.items():
-            self.assertFalse({"name", "aliases", "cves", "flags"}.intersection(rule))
-            if key in CHECKS:
-                self.assertEqual(CHECKS[key]["ids"], rule["ids"])
+        for key in profile.criteria:
+            self.assertEqual(set(profile.checks[key]["flags"]), set(testssl.validation_check(key)["flags"]))
+        self.assertEqual(profile.match("unrelated", ["CVE-2011-1473"]), ())
+        self.assertEqual(profile.match("unrelated", ["CVE-2009-3555"]), ("renegotiation",))
 
     def test_arguments_are_manifest_owned_and_tampering_is_rejected(self):
         profile = get_profile(NMAP_PROFILE_ID)

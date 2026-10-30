@@ -5,16 +5,21 @@ execution hooks a dispatcher's runner consumes. Scanner coverage itself is exerc
 against local TLS services during development, never from the suite.
 """
 
+import io
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stdout
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from faraday_agent_dispatcher.validators import (
-    SUPPORTED_HANDLERS, ProfileError, build_command, collect_evidence, get_profile,
+from faraday_agent_dispatcher.utils.executor_profiles import (
+    SUPPORTED_HANDLERS, ProfileError, build_command, get_profile,
 )
-from faraday_agent_dispatcher.validators import nmap, testssl
+from faraday_agent_dispatcher.static.executors.official import nmap, testssl
 
 TARGET = "192.0.2.10"
 PORT = 443
@@ -41,7 +46,7 @@ def scanner_record(finding_id="TLS1", *, severity="HIGH", finding="offered", tar
 def evidence(records, check_ids=("tls1_0",), target=TARGET, port=PORT):
     profile = get_profile("testssl-3.2.4-ssl-tls")
     return {
-        "format": testssl.EVIDENCE_FORMAT, "profile_id": profile.id, "tool_version": testssl.TOOL_VERSION,
+        "format": testssl.EVIDENCE_FORMAT, "profile_id": profile.id, "tool_version": profile.metadata["tool_version"],
         "target": target, "port": port, "check_ids": list(check_ids), "records": records,
     }
 
@@ -70,6 +75,7 @@ class NmapEvidenceTests(unittest.TestCase):
             (lambda report: report["hosts"][0]["services"][0].__setitem__("protocol", "udp"), "SERVICE_MISMATCH"),
             (lambda report: report["hosts"][0].__setitem__("services", []), "AMBIGUOUS_OR_MISSING_SERVICE"),
             (lambda report: report["hosts"][0]["services"][0].__setitem__("status", "filtered"), "SERVICE_NOT_OPEN"),
+            (lambda report: report["hosts"][0]["services"][0].__setitem__("status", []), "INVALID_SERVICE_OUTPUT"),
             (lambda report: report["hosts"][0]["services"][0].__setitem__("vulnerabilities", []), "MISSING_OR_AMBIGUOUS_SCRIPT"),
             (lambda report: report["hosts"][0]["services"][0]["vulnerabilities"][0].__setitem__("desc", "nothing"),
              "NO_PROTOCOL_CIPHER_EVIDENCE"),
@@ -208,11 +214,166 @@ class TestsslEvidenceTests(unittest.TestCase):
                          "TESTSSL_TARGET_MISMATCH")
 
     def test_strict_json_rejects_duplicates_nonfinite_and_oversized_payload(self):
-        from faraday_agent_dispatcher.validators import strict_json
+        from faraday_agent_dispatcher.utils.executor_profiles import strict_json
 
         for payload in (b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1e999}', b'{"a":1e400}', b"x" * (32768 + 1), b""):
             with self.subTest(payload=payload[:24]), self.assertRaises(ValueError):
                 strict_json(payload)
+
+
+class ApprovedExecutorTests(unittest.TestCase):
+    def test_malformed_records_and_scalar_fields_are_inconclusive(self):
+        profile = get_profile("testssl-3.2.4-ssl-tls")
+        task = testssl_task(profile)
+        malformed = [None, [], 1, "record", [scanner_record()]]
+        for field in ("id", "finding", "severity", "ip", "port"):
+            for value in (None, [], {}, True, 1.5):
+                malformed.append({**scanner_record(), field: value})
+        for item in malformed:
+            with self.subTest(item=item):
+                result = {"state": "COMPLETED", "stdout": json.dumps(evidence([item]))}
+                self.assertEqual(profile.evaluate(task, result)[1], "INCONCLUSIVE")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "scanner.json")
+            for item in malformed:
+                path.write_text(json.dumps([item]), encoding="utf-8")
+                with self.subTest(raw=item), self.assertRaises(ProfileError):
+                    testssl.load_scanner_json(path, TARGET, PORT, ["tls1_0"])
+
+    def test_renegotiation_dos_never_proves_mitm(self):
+        profile = get_profile("testssl-3.2.4-ssl-tls")
+        task = {"target": TARGET, "port": PORT, "arguments": {"CHECK_IDS": ["renegotiation"]}}
+        for finding_id in ("secure_client_renego", "client_renegotiation", "insecure_renego"):
+            result = {"state": "COMPLETED", "stdout": json.dumps(evidence([
+                scanner_record(finding_id, severity="HIGH", finding="VULNERABLE (DoS)")], ["renegotiation"]))}
+            self.assertEqual(profile.evaluate(task, result)[0], {})
+        result = {"state": "COMPLETED", "stdout": json.dumps(evidence([
+            scanner_record("secure_renego", severity="CRITICAL", finding="VULNERABLE")], ["renegotiation"]))}
+        self.assertEqual(profile.evaluate(task, result)[0], {"renegotiation": "REPRODUCED"})
+
+    def test_approved_executor_privacy_faraday_roundtrip_and_temp_cleanup(self):
+        from faraday_plugins.plugins.repo.faraday_json.plugin import FaradayJsonPlugin
+
+        profile = get_profile("testssl-3.2.4-ssl-tls")
+        task = testssl_task(profile)
+        output_paths = []
+
+        def run(argv, **kwargs):
+            self.assertEqual(argv[-1], f"{TARGET}:{PORT}")
+            self.assertEqual(argv[argv.index("--nodns") + 1], "none")
+            for forbidden in ("--phone-out", "--starttls", "--sni", "--openssl", "--custom=1"):
+                self.assertNotIn(forbidden, argv)
+            self.assertEqual(kwargs["env"]["PHONE_OUT"], "false")
+            self.assertFalse(kwargs["capture_output"])
+            self.assertEqual(kwargs["max_file_bytes"], testssl.MAX_SCANNER_JSON_BYTES)
+            self.assertNotIn("BASH_ENV", kwargs["env"])
+            self.assertNotIn("OPENSSL", kwargs["env"])
+            path = Path(argv[argv.index("--jsonfile") + 1])
+            output_paths.append(path)
+            path.write_text(json.dumps([scanner_record(), scanner_record("service", severity="OK", finding="HTTP")]), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stderr=None)
+
+        with patch.dict(os.environ, {"TESTSSL_PATH": sys.executable}):
+            command = build_command(profile, task)
+        hostile = {"EXECUTOR_CONFIG_TESTSSL_EXTRA_ARGS": "--custom=1", "EXECUTOR_CONFIG_TESTSSL_STARTTLS": "smtp",
+                   "EXECUTOR_CONFIG_TESTSSL_TARGET": "other.example:8443", "PHONE_OUT": "true",
+                   "OPENSSL": "/untrusted", "BASH_ENV": "/untrusted"}
+        with patch.dict(os.environ, {**hostile, **command.environment}), patch(
+                "faraday_agent_dispatcher.utils.scanner_process.run_scanner", side_effect=run):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                testssl.main()
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(set(report), {"hosts", "command", "validation_evidence"})
+        self.assertEqual(profile.evaluate(task, {"state": "COMPLETED", "stdout": stdout.getvalue()})[0], {"tls1_0": "REPRODUCED"})
+        self.assertEqual(len(report["hosts"][0]["services"][0]["vulnerabilities"]), 1)
+        parser = FaradayJsonPlugin()
+        parser.parseOutputString(stdout.getvalue())
+        self.assertTrue(json.loads(parser.get_json())["hosts"])
+        self.assertTrue(output_paths)
+        self.assertTrue(all(not path.exists() for path in output_paths))
+
+    def test_approved_executor_failure_never_emits_success(self):
+        from faraday_agent_dispatcher.utils.scanner_process import ScannerProcessError
+
+        profile = get_profile("testssl-3.2.4-ssl-tls")
+        with patch.dict(os.environ, {"TESTSSL_PATH": sys.executable}):
+            command = build_command(profile, testssl_task(profile))
+        for failure in (OSError("cannot start"), testssl.subprocess.TimeoutExpired("testssl.sh", 900),
+                        ScannerProcessError("Scanner stdout limit exceeded")):
+            with patch.dict(os.environ, command.environment), patch(
+                    "faraday_agent_dispatcher.utils.scanner_process.run_scanner", side_effect=failure):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+                    testssl.main()
+                self.assertEqual(raised.exception.code, 1)
+                self.assertEqual(stdout.getvalue(), "")
+
+    def test_duplicate_failed_and_conflicting_records_fail_affected_check_closed(self):
+        profile = get_profile("testssl-3.2.4-ssl-tls")
+        cases = [
+            (["tls1_0"], [scanner_record(), scanner_record(severity="ERROR", finding="analysis failed")]),
+            (["tls1_0"], [scanner_record(), scanner_record()]),
+            (["post_quantum_kex"], [scanner_record("FS_KEMs", severity="OK", finding="-"),
+                                    scanner_record("FS_ciphers", severity="OK", finding="X25519MLKEM768")]),
+            (["weak_ciphers"], [scanner_record("cipherlist_LOW", severity="HIGH", finding="offered"),
+                               scanner_record("cipherlist_EXPORT", severity="ERROR", finding="analysis failed")]),
+        ]
+        for ids, records in cases:
+            task = {"target": TARGET, "port": PORT, "arguments": {"CHECK_IDS": ids}}
+            result = {"state": "COMPLETED", "stdout": json.dumps(evidence(records, ids))}
+            with self.subTest(ids=ids, records=records):
+                self.assertNotIn("REPRODUCED", profile.evaluate(task, result)[0].values())
+
+    def test_nmap_failed_scan_never_parses_valid_looking_xml(self):
+        xml = b'<nmaprun><host><address addr="192.0.2.10" addrtype="ipv4"/></host></nmaprun>'
+        environment = {"FAD_VALIDATION_MODE": "1", "EXECUTOR_CONFIG_TARGET": json.dumps([TARGET])}
+        with patch.dict(os.environ, environment), patch(
+                "faraday_agent_dispatcher.utils.scanner_process.run_scanner",
+                return_value=SimpleNamespace(returncode=1, stdout=xml, stderr=b"failed")), patch(
+                "faraday_plugins.plugins.repo.nmap.plugin.NmapPlugin") as plugin:
+            with redirect_stdout(io.StringIO()) as stdout, self.assertRaises(SystemExit) as raised:
+                nmap.main()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertEqual(stdout.getvalue(), "")
+            plugin.assert_not_called()
+
+    def test_custom_testssl_profile_binding_is_resolved_before_scan(self):
+        from faraday_agent_dispatcher.utils import executor_profiles as registry
+        from tests.unittests.test_validator_profiles import executor_manifest, manifest
+
+        data = manifest("testssl-3.2.4-ssl-tls")
+        data["id"] = "third-testssl-profile"
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "testssl.json").write_text(json.dumps(executor_manifest(data)), encoding="utf-8")
+            profile = registry.load_profiles(directory)[data["id"]]
+        task = testssl_task(profile)
+        with patch.dict(registry._PROFILES, {profile.id: profile}), patch.dict(os.environ, {"TESTSSL_PATH": sys.executable}):
+            command = build_command(profile, task)
+
+            def run(argv, **kwargs):
+                Path(argv[argv.index("--jsonfile") + 1]).write_text(json.dumps([scanner_record()]), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stderr=None)
+
+            with patch.dict(os.environ, command.environment), patch(
+                    "faraday_agent_dispatcher.utils.scanner_process.run_scanner", side_effect=run):
+                with redirect_stdout(io.StringIO()) as stdout:
+                    testssl.main()
+            self.assertEqual(json.loads(stdout.getvalue())["validation_evidence"]["profile_id"], profile.id)
+            self.assertEqual(profile.evaluate(task, {"state": "COMPLETED", "stdout": stdout.getvalue()})[0], {"tls1_0": "REPRODUCED"})
+
+    def test_analysis_error_does_not_prove_fixed_severity_check(self):
+        profile = get_profile("testssl-3.2.4-ssl-tls")
+        task = testssl_task(profile)
+        for severity in ("WARN", "ERROR", "INFO", "SPECIAL"):
+            result = {"state": "COMPLETED", "stdout": json.dumps(evidence([scanner_record(severity=severity)]))}
+            self.assertEqual(profile.evaluate(task, result)[0], {})
+
+
+def testssl_task(profile):
+    claims = profile.claims("vulnerability-1", {"check_ids": ["tls1_0"]})
+    return {"id": "cd" * 16, "profile_id": profile.id, "executor_id": profile.executor_id,
+            "target": TARGET, "port": PORT, "arguments": profile.arguments(TARGET, PORT, claims), "claims": claims}
 
 
 class RuntimeHookTests(unittest.TestCase):
@@ -223,39 +384,48 @@ class RuntimeHookTests(unittest.TestCase):
     def test_nmap_command_is_the_packaged_official_executor(self):
         profile = get_profile("nmap-tls-protocols")
         task, _result = nmap_task(profile)
-        command = build_command(profile, task, work_dir="/tmp")
+        command = build_command(profile, task)
         self.assertEqual(command.handler_id, "nmap_tls")
-        self.assertIsNone(command.evidence_path)
-        self.assertEqual(command.argv[1], nmap.nmap_executor_script())
+        self.assertEqual(command.argv, (sys.executable, nmap.nmap_executor_script()))
         self.assertTrue(command.argv[1].endswith("static/executors/official/nmap.py"))
-        self.assertEqual(command.environment, {"NMAP_UNPRIVILEGED": "1"})
+        self.assertEqual(command.environment, {"NMAP_UNPRIVILEGED": "1", "FAD_VALIDATION_MODE": "1"})
 
-    def test_testssl_command_uses_the_supplied_pinned_binary_and_profile_flags(self):
+    def test_testssl_command_runs_official_executor_with_compact_binding(self):
         profile = get_profile("testssl-3.2.4-ssl-tls")
-        task = {"id": "cd" * 16, "target": TARGET, "port": PORT, "arguments": {"CHECK_IDS": ["tls1_0"]}}
+        task = testssl_task(profile)
+        task["claims"] = [{"vulnerability_id": str(index), "check_id": "tls1_0"} for index in range(10000)]
         with tempfile.TemporaryDirectory() as directory:
-            command = build_command(profile, task, work_dir=directory, testssl_path=TESTSSL_BINARY)
-            self.assertEqual(command.argv[0], TESTSSL_BINARY)
-            self.assertEqual(command.argv[1:2], ("--quiet",))
-            self.assertEqual(command.argv[command.argv.index("--nodns") + 1], "none")
-            self.assertEqual(command.evidence_path, str(Path(directory) / f"testssl-{task['id']}.json"))
-            self.assertEqual(command.environment, {"PHONE_OUT": "false"})
-            Path(command.evidence_path).write_text(json.dumps([scanner_record()]), encoding="utf-8")
-            self.assertEqual(json.loads(collect_evidence(profile, task, command)), {
-                "format": testssl.EVIDENCE_FORMAT, "profile_id": profile.id,
-                "tool_version": testssl.TOOL_VERSION, "target": TARGET, "port": PORT,
-                "check_ids": ["tls1_0"], "records": [{
-                    "id": "TLS1", "severity": "HIGH", "finding": "offered", "ip": TARGET, "port": PORT}],
-            })
+            binary = Path(directory, "testssl.sh")
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o700)
+            with patch.dict(os.environ, {"TESTSSL_PATH": str(binary)}):
+                command = build_command(profile, task)
+            self.assertEqual(command.argv, (sys.executable, str(Path(testssl.__file__).resolve())))
+            self.assertEqual(command.environment["TESTSSL_PATH"], str(binary))
+            self.assertEqual(command.environment["PHONE_OUT"], "false")
+            self.assertEqual(command.environment["FAD_VALIDATION_MODE"], "1")
+            binding = command.environment["FAD_VALIDATION_TASK"]
+            self.assertLess(len(binding), 1024)
+            self.assertEqual(json.loads(binding), {"profile_id": profile.id, "target": TARGET,
+                                                 "port": PORT, "check_ids": ["tls1_0"]})
 
     def test_missing_pinned_binary_and_unknown_handler_fail_closed(self):
         profile = get_profile("testssl-3.2.4-ssl-tls")
-        task = {"id": "cd" * 16, "target": TARGET, "port": PORT, "arguments": {"CHECK_IDS": ["tls1_0"]}}
-        for missing in (None, "", 1):
-            with self.subTest(missing=missing), self.assertRaises(ProfileError):
-                build_command(profile, task, work_dir="/tmp", testssl_path=missing)
+        task = testssl_task(profile)
+        for missing in ("", "testssl.sh", "/does/not/exist", "/tmp"):
+            with self.subTest(missing=missing), patch.dict(os.environ, {"TESTSSL_PATH": missing}), self.assertRaises(ProfileError):
+                build_command(profile, task)
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(ProfileError):
+            build_command(profile, task)
         with self.assertRaises(ProfileError):
-            build_command(SimpleNamespace(handler_id="arbitrary"), task, work_dir="/tmp", testssl_path=TESTSSL_BINARY)
+            build_command(SimpleNamespace(handler_id="arbitrary"), task)
+
+    def test_command_rejects_task_tampering_before_execution(self):
+        profile = get_profile("nmap-tls-protocols")
+        task, _ = nmap_task(profile)
+        task["arguments"]["TARGET"] = ["192.0.2.99"]
+        with self.assertRaises(ProfileError):
+            build_command(profile, task)
 
 
 if __name__ == "__main__":
