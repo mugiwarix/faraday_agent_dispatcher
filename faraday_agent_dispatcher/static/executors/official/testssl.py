@@ -29,16 +29,21 @@ executed. Everything the tool prints goes to stderr, only the Faraday JSON line
 is written to stdout.
 """
 
+import ipaddress
 import json
 import os
 import re
+import selectors
 import shlex
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+
+import psutil
 
 from faraday_agent_dispatcher.utils import arg_helpers
 from faraday_agent_dispatcher.utils.agent_configuration import get_common_parameters
@@ -1056,7 +1061,182 @@ def get_options():
     }
 
 
+EVIDENCE_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "SSL_CERT_FILE"}
+FALSE_VALUES = frozenset(["false", "0", "no", "off", "n"])
+
+
+def _evidence_bool(name, default=False):
+    raw = os.environ.get(f"EXECUTOR_CONFIG_TESTSSL_{name}", "").strip().lower()
+    if not raw:
+        return default
+    if raw in TRUE_VALUES:
+        return True
+    if raw in FALSE_VALUES:
+        return False
+    raise ValueError("Invalid evidence boolean")
+
+
+def _evidence_list(name):
+    raw = os.environ.get(f"EXECUTOR_CONFIG_TESTSSL_{name}", "")
+    if len(raw.encode("utf-8")) > 4096:
+        raise ValueError("Evidence argument exceeds limit")
+    try:
+        values = json.loads(raw) if raw.lstrip().startswith("[") else raw.split(",") if raw else []
+    except (ValueError, RecursionError):
+        raise ValueError("Invalid evidence list") from None
+    if type(values) is not list or any(type(value) not in (str, int) for value in values):
+        raise ValueError("Invalid evidence list")
+    return values
+
+
+def _evidence_timeout(name, maximum):
+    raw = os.environ.get(f"EXECUTOR_CONFIG_TESTSSL_{name}", "") or str(maximum)
+    if not re.fullmatch(r"[0-9]{1,3}", raw) or not 1 <= int(raw) <= maximum:
+        raise ValueError("Evidence timeout outside allowed bounds")
+    return int(raw)
+
+
+def evidence_options():
+    disabled = {"SNEAKY", "IDS_FRIENDLY", "PHONE_OUT", "INCLUDE_INFO"}
+    empty = {"STARTTLS", "EXTRA_ARGS", "ISSUE", "EXCLUDE_VULN"}
+    allowed = disabled | empty | {
+        "EVIDENCE", "TARGET", "PORTS", "VULN", "NODNS", "CONNECT_TIMEOUT", "OPENSSL_TIMEOUT", "TIMEOUT"
+    }
+    prefix = "EXECUTOR_CONFIG_TESTSSL_"
+    if any(key.startswith(prefix) and key[len(prefix):] not in allowed for key in os.environ):
+        raise ValueError("Unsupported evidence option")
+    if any(_evidence_bool(name) for name in disabled):
+        raise ValueError("Evidence mode forbids optional scanner behavior")
+    if any(os.environ.get(prefix + name, "") not in ("", "[]") for name in empty):
+        raise ValueError("Evidence mode forbids extra flags, STARTTLS and check aliases")
+    if os.environ.get(prefix + "NODNS", "") not in ("", "none"):
+        raise ValueError("Evidence mode requires TESTSSL_NODNS=none")
+    targets = _evidence_list("TARGET")
+    if len(targets) != 1 or type(targets[0]) is not str:
+        raise ValueError("Evidence requires one canonical unicast IPv4")
+    target = targets[0]
+    address = ipaddress.IPv4Address(target)
+    if str(address) != target or address.packed[0] == 0 or address.packed[0] >= 224:
+        raise ValueError("Evidence requires one canonical unicast IPv4")
+    ports = _evidence_list("PORTS")
+    if len(ports) != 1 or not re.fullmatch(r"[1-9][0-9]{0,4}", str(ports[0])) or not 1 <= int(ports[0]) <= 65535:
+        raise ValueError("Evidence requires one port (1..65535)")
+    tokens = _evidence_list("VULN")
+    if not tokens:
+        raise ValueError("Evidence requires exact nonempty check keys")
+    check_keys = []
+    for token in tokens:
+        if token == "sslv2_sslv3":
+            _add(check_keys, ["sslv2", "sslv3"])
+        elif type(token) is str and token in CHECKS:
+            _add(check_keys, [token])
+        else:
+            raise ValueError("Unknown evidence check key")
+
+    binary = os.environ.get("TESTSSL_PATH", "")
+    if not os.path.isabs(binary) or not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        raise ValueError("TESTSSL_PATH must be an absolute existing executable file")
+    openssl = os.environ.get("OPENSSL_PATH") or None
+    if openssl and (not os.path.isabs(openssl) or not os.path.isfile(openssl) or not os.access(openssl, os.X_OK)):
+        raise ValueError("OPENSSL_PATH must be an absolute existing executable file")
+    options = {
+        "binary": binary, "openssl": openssl, "starttls": "", "nodns": "none",
+        "connect_timeout": _evidence_timeout("CONNECT_TIMEOUT", 5),
+        "openssl_timeout": _evidence_timeout("OPENSSL_TIMEOUT", 10),
+        "timeout": _evidence_timeout("TIMEOUT", 900),
+        "sneaky": False, "ids_friendly": False, "phone_out": False, "extra_args": [],
+    }
+    return target, int(ports[0]), check_keys, options
+
+
+def _evidence_error(error):
+    message = ("testssl evidence: " + str(error)).encode("utf-8", errors="replace")[:2047]
+    print(message.decode("utf-8", errors="ignore"), file=sys.stderr)
+
+
+def _stop_evidence(proc):
+    try:
+        children = psutil.Process(proc.pid).children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
+    proc.kill()
+    for child in children:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+    proc.wait()
+    psutil.wait_procs(children, timeout=1)
+
+
+def _run_evidence(cmd, *, env, timeout):
+    with subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+    ) as proc:
+        try:
+            deadline = time.monotonic() + timeout
+            with selectors.DefaultSelector() as watcher:
+                watcher.register(proc.stderr, selectors.EVENT_READ)
+                while watcher.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    for key, _ in watcher.select(remaining):
+                        if os.read(key.fd, 2048):
+                            raise ValueError("Scanner wrote stderr; evidence rejected")
+                        watcher.unregister(key.fileobj)
+                return proc.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
+            _stop_evidence(proc)
+            raise
+
+
+def evidence_main():
+    try:
+        target, port, check_keys, options = evidence_options()
+        # Imports/plugins may print banners; stdout is exclusively the final report.
+        with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
+            from faraday_plugins.plugins.repo.testssl.plugin import EvidenceLimit, createPlugin
+        try:
+            started = time.time()
+            environment = {key: value for key, value in os.environ.items() if key in EVIDENCE_ENV}
+            environment["PHONE_OUT"] = "false"
+            with tempfile.TemporaryDirectory(prefix="testssl-evidence-") as tmpdir:
+                uri = f"{target}:{port}"
+                cmd = build_command(uri, os.path.join(tmpdir, "scan.json"), check_keys, options)
+                returncode = _run_evidence(cmd, env=environment, timeout=options["timeout"])
+                if returncode != 0:
+                    raise ValueError("Scanner failed; partial evidence rejected")
+                finding_ids = sorted({finding_id for key in check_keys for finding_id in CHECKS[key]["ids"]})
+                with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
+                    plugin = createPlugin(target=target, port=port, finding_ids=finding_ids, max_records=64)
+                    plugin.processReport(os.path.join(tmpdir, "scan.json"))
+                    report = plugin.get_data()
+                report["command"] = faraday_command(cmd, uri, started)
+                output = json.dumps(report, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+                if len(output.encode("utf-8")) + 1 > 32768:
+                    raise EvidenceLimit("Serialized evidence exceeds stdout limit")
+            print(output, flush=True)
+            return 0
+        except EvidenceLimit as exc:
+            _evidence_error(exc)
+            return 3
+    except KeyboardInterrupt:
+        _evidence_error("Scanner interrupted")
+        return 1
+    except (ValueError, OSError, ImportError, subprocess.TimeoutExpired) as exc:
+        _evidence_error(exc)
+        return 1
+
+
 def main():
+    try:
+        evidence = _evidence_bool("EVIDENCE")
+    except ValueError as exc:
+        _evidence_error(exc)
+        sys.exit(1)
+    if evidence:
+        sys.exit(evidence_main())
     agent_config = get_common_parameters()
     targets = _tokens("TARGET")
     if not targets:
